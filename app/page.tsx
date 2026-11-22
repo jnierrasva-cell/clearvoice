@@ -1,3 +1,4 @@
+
 "use client";
 
 import { useEffect, useRef, useState } from "react";
@@ -9,19 +10,31 @@ import {
   Settings2,
   Volume2,
   Waves,
+  Circle,
+  Square,
+  Download,
+  Play,
 } from "lucide-react";
 
 export default function Home() {
   const [enabled, setEnabled] = useState(true);
   const [isActive, setIsActive] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedDevice, setSelectedDevice] = useState("");
   const [level, setLevel] = useState(0);
   const [message, setMessage] = useState("Microphone not connected");
+  const [recordingUrl, setRecordingUrl] = useState("");
+  const [recordingStatus, setRecordingStatus] = useState(
+    "No recording yet"
+  );
 
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const animationRef = useRef<number | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const recordingUrlRef = useRef("");
 
   async function loadDevices() {
     try {
@@ -40,9 +53,24 @@ export default function Home() {
     }
   }
 
+  function clearPreviousRecording() {
+    if (recordingUrlRef.current) {
+      URL.revokeObjectURL(recordingUrlRef.current);
+      recordingUrlRef.current = "";
+    }
+
+    setRecordingUrl("");
+    setRecordingStatus("No recording yet");
+  }
+
   async function stopMicrophone() {
+    if (recorderRef.current?.state === "recording") {
+      recorderRef.current.stop();
+    }
+
     if (animationRef.current) {
       cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
     }
 
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -107,6 +135,80 @@ export default function Home() {
     }
   }
 
+  function startRecording() {
+    const stream = streamRef.current;
+
+    if (!stream || !isActive) {
+      setRecordingStatus("Connect your microphone first.");
+      return;
+    }
+
+    if (!window.MediaRecorder) {
+      setRecordingStatus("Recording is not supported by this browser.");
+      return;
+    }
+
+    try {
+      clearPreviousRecording();
+      chunksRef.current = [];
+
+      const mimeTypes = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4",
+      ];
+
+      const supportedType = mimeTypes.find((type) =>
+        MediaRecorder.isTypeSupported(type)
+      );
+
+      const recorder = supportedType
+        ? new MediaRecorder(stream, { mimeType: supportedType })
+        : new MediaRecorder(stream);
+
+      recorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, {
+          type: recorder.mimeType || "audio/webm",
+        });
+
+        const url = URL.createObjectURL(blob);
+
+        recordingUrlRef.current = url;
+        setRecordingUrl(url);
+        setRecordingStatus("Recording ready to play");
+        setIsRecording(false);
+      };
+
+      recorder.onerror = () => {
+        setRecordingStatus("Recording encountered an error.");
+        setIsRecording(false);
+      };
+
+      recorder.start();
+
+      setIsRecording(true);
+      setRecordingStatus("Recording in progress...");
+    } catch (error) {
+      console.error(error);
+      setRecordingStatus("Unable to start recording.");
+    }
+  }
+
+  function stopRecording() {
+    if (recorderRef.current?.state === "recording") {
+      recorderRef.current.stop();
+      setRecordingStatus("Preparing your recording...");
+    }
+  }
+
   useEffect(() => {
     loadDevices();
 
@@ -115,8 +217,16 @@ export default function Home() {
         cancelAnimationFrame(animationRef.current);
       }
 
+      if (recorderRef.current?.state === "recording") {
+        recorderRef.current.stop();
+      }
+
       streamRef.current?.getTracks().forEach((track) => track.stop());
       void audioContextRef.current?.close();
+
+      if (recordingUrlRef.current) {
+        URL.revokeObjectURL(recordingUrlRef.current);
+      }
     };
   }, []);
 
@@ -130,7 +240,9 @@ export default function Home() {
             </div>
             <div>
               <h1 className="text-xl font-bold">ClearVoice</h1>
-              <p className="text-xs text-gray-400">AI Audio Enhancement</p>
+              <p className="text-xs text-gray-400">
+                AI Audio Enhancement
+              </p>
             </div>
           </div>
 
@@ -175,7 +287,8 @@ export default function Home() {
                       height: `${Math.max(
                         5,
                         isActive
-                          ? (level / 100) * (20 + Math.abs(Math.sin(index)) * 70)
+                          ? (level / 100) *
+                              (20 + Math.abs(Math.sin(index)) * 70)
                           : 5
                       )}px`,
                     }}
@@ -203,6 +316,77 @@ export default function Home() {
                 {isActive ? <MicOff size={20} /> : <Mic size={20} />}
                 {isActive ? "Stop microphone" : "Start microphone test"}
               </button>
+            </div>
+
+            <div className="mt-6 rounded-3xl border border-white/10 bg-[#111622] p-6 md:p-8">
+              <div className="mb-5 flex items-center justify-between">
+                <div>
+                  <h3 className="font-semibold">Record & Playback</h3>
+                  <p className="mt-1 text-sm text-gray-400">
+                    Record your voice and listen to the result.
+                  </p>
+                </div>
+                <div className="rounded-xl bg-red-500/10 p-3 text-red-400">
+                  <Circle size={22} />
+                </div>
+              </div>
+
+              <div className="mb-5 rounded-xl bg-white/5 p-4 text-sm text-gray-300">
+                {recordingStatus}
+                <p className="mt-1 text-xs text-gray-500">
+                  Current setting: Noise suppression{" "}
+                  {enabled ? "ON" : "OFF"}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  onClick={startRecording}
+                  disabled={!isActive || isRecording}
+                  className="flex items-center justify-center gap-2 rounded-xl bg-red-500 px-4 py-3 font-semibold text-white transition hover:bg-red-400 disabled:opacity-40"
+                >
+                  <Circle size={17} />
+                  Record
+                </button>
+
+                <button
+                  onClick={stopRecording}
+                  disabled={!isRecording}
+                  className="flex items-center justify-center gap-2 rounded-xl border border-white/10 px-4 py-3 font-semibold text-white transition hover:bg-white/5 disabled:opacity-40"
+                >
+                  <Square size={17} />
+                  Stop
+                </button>
+              </div>
+
+              {recordingUrl && (
+                <div className="mt-6 space-y-3">
+                  <div className="flex items-center gap-2 text-sm font-medium text-green-300">
+                    <Play size={17} />
+                    Your recording is ready
+                  </div>
+
+                  <audio
+                    controls
+                    src={recordingUrl}
+                    className="w-full"
+                  />
+
+                  <a
+                    href={recordingUrl}
+                    download="clearvoice-test.webm"
+                    className="flex items-center justify-center gap-2 rounded-xl border border-white/10 px-4 py-3 text-sm text-violet-300 transition hover:bg-white/5"
+                  >
+                    <Download size={17} />
+                    Download recording
+                  </a>
+                </div>
+              )}
+
+              <p className="mt-5 text-xs leading-5 text-gray-500">
+                Recordings are processed and stored locally in your browser
+                during this session. They are not uploaded to a server.
+              </p>
             </div>
           </div>
 
@@ -284,4 +468,3 @@ export default function Home() {
     </main>
   );
 }
-
