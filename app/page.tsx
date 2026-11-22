@@ -139,10 +139,13 @@ export default function Home() {
         "deepfilternet3-noise-filter"
       );
 
-      const processor = new DeepFilterNet3Core({
-        sampleRate: 48000,
-        noiseReductionLevel: 0,
-      });
+const processor = new DeepFilterNet3Core({
+  sampleRate: 48000,
+  noiseReductionLevel: 0,
+  assetConfig: {
+    cdnUrl: "/api/deepfilter-assets",
+  },
+});
 
       processorRef.current = processor;
       await processor.initialize();
