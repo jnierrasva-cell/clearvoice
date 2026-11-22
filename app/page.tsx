@@ -8,29 +8,42 @@ import {
   MicOff,
   ShieldCheck,
   Settings2,
-  Volume2,
   Waves,
   Circle,
   Square,
   Download,
   Play,
+  Cpu,
 } from "lucide-react";
 
+type AudioProcessor = {
+  initialize: () => Promise<void>;
+  createAudioWorkletNode: (context: AudioContext) => Promise<AudioWorkletNode>;
+  setSuppressionLevel: (level: number) => void;
+  destroy: () => void;
+};
+
 export default function Home() {
-  const [enabled, setEnabled] = useState(true);
   const [isActive, setIsActive] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedDevice, setSelectedDevice] = useState("");
   const [level, setLevel] = useState(0);
+  const [suppressionLevel, setSuppressionLevel] = useState(80);
+  const [recordingSource, setRecordingSource] = useState("processed");
   const [message, setMessage] = useState("Microphone not connected");
+  const [engineStatus, setEngineStatus] = useState("Engine not loaded");
   const [recordingUrl, setRecordingUrl] = useState("");
   const [recordingStatus, setRecordingStatus] = useState(
     "No recording yet"
   );
 
   const streamRef = useRef<MediaStream | null>(null);
+  const processedStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<AudioProcessor | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const animationRef = useRef<number | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -68,13 +81,24 @@ export default function Home() {
       recorderRef.current.stop();
     }
 
-    if (animationRef.current) {
+    if (animationRef.current !== null) {
       cancelAnimationFrame(animationRef.current);
       animationRef.current = null;
     }
 
     streamRef.current?.getTracks().forEach((track) => track.stop());
+    processedStreamRef.current
+      ?.getTracks()
+      .forEach((track) => track.stop());
+
     streamRef.current = null;
+    processedStreamRef.current = null;
+
+    workletNodeRef.current?.disconnect();
+    workletNodeRef.current = null;
+
+    processorRef.current?.destroy();
+    processorRef.current = null;
 
     await audioContextRef.current?.close();
     audioContextRef.current = null;
@@ -82,9 +106,14 @@ export default function Home() {
     setIsActive(false);
     setLevel(0);
     setMessage("Microphone disconnected");
+    setEngineStatus("Engine not loaded");
   }
 
   async function startMicrophone() {
+    setIsLoading(true);
+    setMessage("Initializing microphone...");
+    setEngineStatus("Loading DeepFilterNet3...");
+
     try {
       await stopMicrophone();
 
@@ -93,22 +122,52 @@ export default function Home() {
           deviceId: selectedDevice
             ? { exact: selectedDevice }
             : undefined,
-          noiseSuppression: enabled,
+          noiseSuppression: false,
           echoCancellation: true,
           autoGainControl: true,
+          channelCount: 1,
         },
       });
 
       streamRef.current = stream;
 
-      const context = new AudioContext();
+      const context = new AudioContext({ sampleRate: 48000 });
       audioContextRef.current = context;
+      await context.resume();
+
+      const { DeepFilterNet3Core } = await import(
+        "deepfilternet3-noise-filter"
+      );
+
+      const processor = new DeepFilterNet3Core({
+        sampleRate: 48000,
+        noiseReductionLevel: 0,
+      });
+
+      processorRef.current = processor;
+      await processor.initialize();
+
+      const workletNode = await processor.createAudioWorkletNode(context);
+      workletNodeRef.current = workletNode;
 
       const source = context.createMediaStreamSource(stream);
+      const destination = context.createMediaStreamDestination();
+
+      source.connect(workletNode);
+      workletNode.connect(destination);
+
+      processedStreamRef.current = destination.stream;
+
+      // Monitor processed audio without playing it through the speakers.
       const analyser = context.createAnalyser();
+      const silentGain = context.createGain();
 
       analyser.fftSize = 256;
-      source.connect(analyser);
+      silentGain.gain.value = 0;
+
+      workletNode.connect(analyser);
+      analyser.connect(silentGain);
+      silentGain.connect(context.destination);
 
       const data = new Uint8Array(analyser.frequencyBinCount);
 
@@ -123,22 +182,38 @@ export default function Home() {
         animationRef.current = requestAnimationFrame(updateLevel);
       }
 
+      processor.setSuppressionLevel(suppressionLevel);
       updateLevel();
 
       setIsActive(true);
-      setMessage("Microphone is active");
+      setMessage("AI microphone processing is active");
+      setEngineStatus("DeepFilterNet3 ready");
+
       await loadDevices();
     } catch (error) {
-      console.error(error);
-      setMessage("Microphone access failed. Check browser permissions.");
-      setIsActive(false);
+      console.error("ClearVoice engine error:", error);
+
+      await stopMicrophone();
+
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to initialize audio processing."
+      );
+
+      setEngineStatus("Engine initialization failed");
+    } finally {
+      setIsLoading(false);
     }
   }
 
   function startRecording() {
-    const stream = streamRef.current;
+    const selectedStream =
+      recordingSource === "processed"
+        ? processedStreamRef.current
+        : streamRef.current;
 
-    if (!stream || !isActive) {
+    if (!selectedStream || !isActive) {
       setRecordingStatus("Connect your microphone first.");
       return;
     }
@@ -163,8 +238,8 @@ export default function Home() {
       );
 
       const recorder = supportedType
-        ? new MediaRecorder(stream, { mimeType: supportedType })
-        : new MediaRecorder(stream);
+        ? new MediaRecorder(selectedStream, { mimeType: supportedType })
+        : new MediaRecorder(selectedStream);
 
       recorderRef.current = recorder;
 
@@ -209,11 +284,16 @@ export default function Home() {
     }
   }
 
+  function updateSuppression(value: number) {
+    setSuppressionLevel(value);
+    processorRef.current?.setSuppressionLevel(value);
+  }
+
   useEffect(() => {
     loadDevices();
 
     return () => {
-      if (animationRef.current) {
+      if (animationRef.current !== null) {
         cancelAnimationFrame(animationRef.current);
       }
 
@@ -222,6 +302,11 @@ export default function Home() {
       }
 
       streamRef.current?.getTracks().forEach((track) => track.stop());
+      processedStreamRef.current
+        ?.getTracks()
+        .forEach((track) => track.stop());
+
+      processorRef.current?.destroy();
       void audioContextRef.current?.close();
 
       if (recordingUrlRef.current) {
@@ -246,9 +331,8 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2 rounded-full border border-white/10 px-4 py-2 text-xs text-gray-300">
-            <span className="h-2 w-2 rounded-full bg-green-400" />
-            Browser MVP
+          <div className="rounded-full border border-white/10 px-4 py-2 text-xs text-gray-300">
+            Browser AI Engine
           </div>
         </header>
 
@@ -263,19 +347,17 @@ export default function Home() {
             </h2>
 
             <p className="mt-5 max-w-xl leading-7 text-gray-400">
-              Reduce unwanted background noise and create a cleaner
-              microphone experience for your calls.
+              AI-powered microphone enhancement, running locally
+              in your browser.
             </p>
 
             <div className="mt-10 rounded-3xl border border-white/10 bg-[#111622] p-6 md:p-8">
               <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="font-semibold">Microphone monitor</h3>
+                  <h3 className="font-semibold">Processed microphone</h3>
                   <p className="mt-1 text-sm text-gray-400">{message}</p>
                 </div>
-                <div className="rounded-xl bg-violet-500/15 p-3 text-violet-300">
-                  <Waves size={22} />
-                </div>
+                <Waves className="text-violet-300" size={24} />
               </div>
 
               <div className="my-10 flex h-24 items-center justify-center gap-1">
@@ -298,7 +380,7 @@ export default function Home() {
 
               <div className="mb-6">
                 <div className="mb-2 flex justify-between text-sm">
-                  <span className="text-gray-400">Input level</span>
+                  <span className="text-gray-400">Processed output level</span>
                   <span>{isActive ? level : 0}%</span>
                 </div>
                 <div className="h-2 overflow-hidden rounded-full bg-white/10">
@@ -311,39 +393,66 @@ export default function Home() {
 
               <button
                 onClick={isActive ? stopMicrophone : startMicrophone}
-                className="flex w-full items-center justify-center gap-3 rounded-xl bg-violet-600 px-6 py-4 font-semibold transition hover:bg-violet-500"
+                disabled={isLoading}
+                className="flex w-full items-center justify-center gap-3 rounded-xl bg-violet-600 px-6 py-4 font-semibold transition hover:bg-violet-500 disabled:opacity-50"
               >
-                {isActive ? <MicOff size={20} /> : <Mic size={20} />}
-                {isActive ? "Stop microphone" : "Start microphone test"}
+                {isLoading ? (
+                  <Cpu size={20} />
+                ) : isActive ? (
+                  <MicOff size={20} />
+                ) : (
+                  <Mic size={20} />
+                )}
+                {isLoading
+                  ? "Initializing AI engine..."
+                  : isActive
+                    ? "Stop microphone"
+                    : "Start AI microphone"}
               </button>
+
+              <div className="mt-4 flex items-center gap-2 text-xs text-gray-400">
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    isActive ? "bg-green-400" : "bg-gray-500"
+                  }`}
+                />
+                {engineStatus}
+              </div>
             </div>
 
             <div className="mt-6 rounded-3xl border border-white/10 bg-[#111622] p-6 md:p-8">
               <div className="mb-5 flex items-center justify-between">
                 <div>
-                  <h3 className="font-semibold">Record & Playback</h3>
+                  <h3 className="font-semibold">Record & compare</h3>
                   <p className="mt-1 text-sm text-gray-400">
-                    Record your voice and listen to the result.
+                    Choose which microphone signal to record.
                   </p>
                 </div>
-                <div className="rounded-xl bg-red-500/10 p-3 text-red-400">
-                  <Circle size={22} />
-                </div>
+                <Circle className="text-red-400" size={22} />
               </div>
+
+              <label className="mb-2 block text-sm text-gray-400">
+                Recording source
+              </label>
+
+              <select
+                value={recordingSource}
+                onChange={(event) => setRecordingSource(event.target.value)}
+                className="mb-5 w-full rounded-xl border border-white/10 bg-[#080b12] p-3 text-sm"
+              >
+                <option value="processed">AI processed output</option>
+                <option value="raw">Original microphone input</option>
+              </select>
 
               <div className="mb-5 rounded-xl bg-white/5 p-4 text-sm text-gray-300">
                 {recordingStatus}
-                <p className="mt-1 text-xs text-gray-500">
-                  Current setting: Noise suppression{" "}
-                  {enabled ? "ON" : "OFF"}
-                </p>
               </div>
 
               <div className="grid grid-cols-2 gap-3">
                 <button
                   onClick={startRecording}
                   disabled={!isActive || isRecording}
-                  className="flex items-center justify-center gap-2 rounded-xl bg-red-500 px-4 py-3 font-semibold text-white transition hover:bg-red-400 disabled:opacity-40"
+                  className="flex items-center justify-center gap-2 rounded-xl bg-red-500 px-4 py-3 font-semibold text-white disabled:opacity-40"
                 >
                   <Circle size={17} />
                   Record
@@ -352,7 +461,7 @@ export default function Home() {
                 <button
                   onClick={stopRecording}
                   disabled={!isRecording}
-                  className="flex items-center justify-center gap-2 rounded-xl border border-white/10 px-4 py-3 font-semibold text-white transition hover:bg-white/5 disabled:opacity-40"
+                  className="flex items-center justify-center gap-2 rounded-xl border border-white/10 px-4 py-3 font-semibold disabled:opacity-40"
                 >
                   <Square size={17} />
                   Stop
@@ -361,9 +470,9 @@ export default function Home() {
 
               {recordingUrl && (
                 <div className="mt-6 space-y-3">
-                  <div className="flex items-center gap-2 text-sm font-medium text-green-300">
+                  <div className="flex items-center gap-2 text-sm text-green-300">
                     <Play size={17} />
-                    Your recording is ready
+                    Recording ready
                   </div>
 
                   <audio
@@ -374,8 +483,8 @@ export default function Home() {
 
                   <a
                     href={recordingUrl}
-                    download="clearvoice-test.webm"
-                    className="flex items-center justify-center gap-2 rounded-xl border border-white/10 px-4 py-3 text-sm text-violet-300 transition hover:bg-white/5"
+                    download={`clearvoice-${recordingSource}-test.webm`}
+                    className="flex items-center justify-center gap-2 rounded-xl border border-white/10 px-4 py-3 text-sm text-violet-300"
                   >
                     <Download size={17} />
                     Download recording
@@ -384,8 +493,8 @@ export default function Home() {
               )}
 
               <p className="mt-5 text-xs leading-5 text-gray-500">
-                Recordings are processed and stored locally in your browser
-                during this session. They are not uploaded to a server.
+                Recordings remain in your browser session and are not
+                uploaded to a ClearVoice server.
               </p>
             </div>
           </div>
@@ -415,54 +524,73 @@ export default function Home() {
 
               <div className="my-6 border-t border-white/10" />
 
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <h4 className="font-medium">Noise suppression</h4>
-                  <p className="mt-1 text-xs text-gray-400">
-                    Browser-supported processing
-                  </p>
-                </div>
+              <div className="flex items-center justify-between">
+                <h4 className="font-medium">AI suppression strength</h4>
+                <span className="text-sm text-violet-300">
+                  {suppressionLevel}%
+                </span>
+              </div>
 
-                <button
-                  onClick={() => setEnabled(!enabled)}
-                  className={`h-7 w-12 rounded-full p-1 transition ${
-                    enabled ? "bg-violet-600" : "bg-gray-600"
-                  }`}
-                  aria-label="Toggle noise suppression"
-                  aria-pressed={enabled}
-                >
-                  <span
-                    className={`block h-5 w-5 rounded-full bg-white transition ${
-                      enabled ? "translate-x-5" : "translate-x-0"
-                    }`}
-                  />
-                </button>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="5"
+                value={suppressionLevel}
+                onChange={(event) =>
+                  updateSuppression(Number(event.target.value))
+                }
+                className="mt-5 w-full accent-violet-500"
+              />
+
+              <div className="mt-2 flex justify-between text-xs text-gray-500">
+                <span>Gentle</span>
+                <span>Strong</span>
               </div>
 
               <div className="mt-6 rounded-xl bg-violet-500/10 p-4 text-sm text-violet-200">
                 <ShieldCheck className="mb-2" size={20} />
-                Noise suppression is currently handled by your browser.
-                Advanced AI voice isolation is planned for a later version.
+                DeepFilterNet3 processes audio locally using WebAssembly.
+                Stronger suppression can also affect natural voice quality.
               </div>
             </div>
 
             <div className="rounded-3xl border border-white/10 bg-[#111622] p-6">
               <div className="mb-3 flex items-center gap-3">
-                <Volume2 className="text-violet-300" />
-                <h3 className="font-semibold">What comes next?</h3>
+                <Cpu className="text-violet-300" />
+                <h3 className="font-semibold">Processing engine</h3>
               </div>
+
+              <p className="text-sm leading-6 text-gray-400">
+                DeepFilterNet3 — neural speech enhancement engine.
+                Browser-native noise suppression is disabled in the
+                input stream to avoid stacking two noise filters.
+              </p>
+
+              <div className="my-4 border-t border-white/10" />
+
               <ul className="space-y-3 text-sm text-gray-400">
-                <li>• Advanced AI noise removal</li>
-                <li>• Voice isolation from nearby conversations</li>
-                <li>• Processed audio comparison</li>
-                <li>• Virtual microphone for meeting apps</li>
+                <li>• Local browser processing</li>
+                <li>• Raw and processed recording</li>
+                <li>• Adjustable suppression strength</li>
+                <li>• No audio upload required</li>
+              </ul>
+            </div>
+
+            <div className="rounded-3xl border border-white/10 bg-[#111622] p-6">
+              <h3 className="mb-3 font-semibold">Future development</h3>
+              <ul className="space-y-3 text-sm text-gray-400">
+                <li>• Dedicated background music suppression tests</li>
+                <li>• Competing voice isolation research</li>
+                <li>• Audio quality and latency measurements</li>
+                <li>• Virtual microphone support</li>
               </ul>
             </div>
           </aside>
         </section>
 
         <footer className="border-t border-white/10 py-6 text-center text-xs text-gray-500">
-          ClearVoice — Early Development Build
+          ClearVoice — AI Audio Enhancement
         </footer>
       </div>
     </main>
