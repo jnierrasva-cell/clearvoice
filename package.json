@@ -1,19 +1,20 @@
 {
   "name": "clearvoice",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "postinstall": "node scripts/copy-assets.js"
   },
   "dependencies": {
     "next": "^16.3.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "lucide-react": "^0.468.0",
-"@lofcz/deepfilternet-web": "^0.1.0"
+    "@lofcz/deepfilternet-web": "^0.1.0"
   },
   "devDependencies": {
     "@types/node": "^22",
